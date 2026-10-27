@@ -661,11 +661,21 @@ export class PostgresIndexStore implements IndexStore {
     );
   }
 
-  async commitSyncBatch(
-    vaultId: string,
-    syncId: string,
-  ): Promise<void> {
-    const result = await this.pool.query<{
+  
+async commitSyncBatch(
+  vaultId: string,
+  syncId: string,
+): Promise<void> {
+  const client = await this.pool.connect();
+  const previousGeneratedAt = this.generatedAt;
+  const previousStats = this.stats;
+  let transactionStarted = false;
+
+  try {
+    await client.query("begin");
+    transactionStarted = true;
+
+    const result = await client.query<{
       tenant_id: string;
       batch_index: number;
       total_batches: number;
@@ -677,7 +687,8 @@ export class PostgresIndexStore implements IndexStore {
          payload, documents
        from vault_sync_staging
        where vault_id = $1 and sync_id = $2
-       order by batch_index asc`,
+       order by batch_index asc
+       for update`,
       [vaultId, syncId],
     );
 
@@ -691,6 +702,8 @@ export class PostgresIndexStore implements IndexStore {
     const tenantId = batches[0].tenant_id;
 
     if (
+      !Number.isInteger(totalBatches) ||
+      totalBatches < 1 ||
       batches.length !== totalBatches ||
       batches.some(
         (batch, index) =>
@@ -712,19 +725,33 @@ export class PostgresIndexStore implements IndexStore {
       ),
     } as SyncPayload;
 
-    // The existing replace() method performs the
-    // authoritative index replacement in a transaction.
-    // If it fails, staged data remains available.
-    await this.replace(payload);
+    await this.replaceWithClient(payload, client);
 
-    await this.pool.query(
+    await client.query(
       `delete from vault_sync_staging
        where tenant_id = $1
          and vault_id = $2
          and sync_id = $3`,
       [tenantId, vaultId, syncId],
     );
+
+    await client.query("commit");
+    transactionStarted = false;
+  } catch (error) {
+    if (transactionStarted) {
+      try {
+        await client.query("rollback");
+      } finally {
+        this.generatedAt = previousGeneratedAt;
+        this.stats = previousStats;
+      }
+    }
+
+    throw error;
+  } finally {
+    client.release();
   }
+}
 
 private async replaceWithClient(
   payload: SyncPayload,
