@@ -936,8 +936,10 @@ async syncNow() {
       url: `${baseUrl}/sync/commit`,
       method: "POST",
       headers,
-      body: JSON.stringify({ sync_id: syncId }),
-    });
+     body: JSON.stringify({
+  sync_id: syncId,
+  tenant_id: this.settings.tenantId,
+}),
 
     if (
       commitResponse.status < 200 ||
