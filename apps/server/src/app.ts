@@ -150,6 +150,93 @@ export function createApp(config: ServerConfig, store: IndexStore) {
     });
   });
 
+  app.post(
+    "/admin/vaults/:vaultId/sync/batch",
+    requireBearerToken(config.syncToken),
+    async (req: Request, res: Response) => {
+      const vaultId = paramValue(req.params.vaultId);
+
+      const body = req.body as {
+        sync_id?: unknown;
+        batch_index?: unknown;
+        total_batches?: unknown;
+        payload?: Partial<SyncPayload>;
+        documents?: unknown;
+      };
+
+      if (
+        typeof body.sync_id !== "string" ||
+        !body.sync_id.trim() ||
+        body.sync_id.length > 128
+      ) {
+        res.status(400).json({ error: "invalid_sync_id" });
+        return;
+      }
+
+      if (
+        !Number.isInteger(body.batch_index) ||
+        !Number.isInteger(body.total_batches) ||
+        Number(body.batch_index) < 0 ||
+        Number(body.total_batches) < 1 ||
+        Number(body.total_batches) > 10000 ||
+        Number(body.batch_index) >= Number(body.total_batches)
+      ) {
+        res.status(400).json({ error: "invalid_sync_batch" });
+        return;
+      }
+
+      if (!Array.isArray(body.documents)) {
+        res.status(400).json({ error: "documents_array_required" });
+        return;
+      }
+
+      if (body.documents.length > 1000) {
+        res.status(400).json({ error: "too_many_documents_in_batch" });
+        return;
+      }
+
+      await store.stageSyncBatch(
+        vaultId,
+        body.sync_id,
+        Number(body.batch_index),
+        Number(body.total_batches),
+        body.payload ?? {},
+        body.documents as SyncPayload["documents"],
+      );
+
+      res.status(202).json({
+        ok: true,
+        sync_id: body.sync_id,
+        batch_index: Number(body.batch_index),
+      });
+    },
+  );
+
+  app.post(
+    "/admin/vaults/:vaultId/sync/commit",
+    requireBearerToken(config.syncToken),
+    async (req: Request, res: Response) => {
+      const vaultId = paramValue(req.params.vaultId);
+      const body = req.body as { sync_id?: unknown };
+
+      if (
+        typeof body.sync_id !== "string" ||
+        !body.sync_id.trim() ||
+        body.sync_id.length > 128
+      ) {
+        res.status(400).json({ error: "invalid_sync_id" });
+        return;
+      }
+
+      await store.commitSyncBatch(vaultId, body.sync_id);
+
+      res.json({
+        ok: true,
+        vault: await store.vaultStatus(vaultId),
+      });
+    },
+  );
+
   app.get("/admin/vaults/:vaultId/write-proposals", requireBearerToken(config.syncToken), async (req: Request, res: Response) => {
     const vaultId = paramValue(req.params.vaultId);
     res.json({ proposals: await store.listWriteProposals(vaultId) });
