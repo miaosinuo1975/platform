@@ -79,6 +79,89 @@ describe("server MCP contract", () => {
     expect(health.last_sync_at).toBeNull();
   });
 
+it("stages vault sync batches and rejects incomplete commits", async () => {
+  const { store, indexFile } = await createStore();
+  const config = testConfig(indexFile);
+  const server = await listen(createApp(config, store));
+  const baseUrl =
+    `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const vaultId = "batch-test-vault";
+  const syncId = "batch-test-sync";
+
+  const sendBatch = async (
+    batchIndex: number,
+    documents: VaultDocument[],
+  ) => fetch(
+    `${baseUrl}/admin/vaults/${vaultId}/sync/batch`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.syncToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sync_id: syncId,
+        batch_index: batchIndex,
+        total_batches: 2,
+        payload: {
+          vault_id: vaultId,
+          generated_at: "2026-10-28T00:00:00.000Z",
+        },
+        documents,
+      }),
+    },
+  );
+
+  // Stage the first batch.
+  const firstBatch = await sendBatch(
+    0,
+    [fixtureDocument({ id: "batch-doc-1" })],
+  );
+  expect(firstBatch.status).toBe(202);
+
+  // A missing batch must not replace the formal index.
+  const incompleteCommit = await fetch(
+    `${baseUrl}/admin/vaults/${vaultId}/sync/commit`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.syncToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sync_id: syncId }),
+    },
+  );
+
+  expect(incompleteCommit.status).toBeGreaterThanOrEqual(400);
+  expect((await store.vaultStatus(vaultId)).document_count).toBe(0);
+
+  // Stage the missing batch.
+  const secondBatch = await sendBatch(
+    1,
+    [fixtureDocument({
+      id: "batch-doc-2",
+      path: "20 Projects/Batch Test/Second.md",
+    })],
+  );
+  expect(secondBatch.status).toBe(202);
+
+  // Both batches must now commit together.
+  const completeCommit = await fetch(
+    `${baseUrl}/admin/vaults/${vaultId}/sync/commit`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.syncToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sync_id: syncId }),
+    },
+  );
+
+  expect(completeCommit.status).toBe(200);
+  expect((await store.vaultStatus(vaultId)).document_count).toBe(2);
+});
+
   it("syncs documents and exposes read-only vault tools over authenticated MCP", async () => {
     const { store, indexFile } = await createStore();
     const config = testConfig(indexFile);
