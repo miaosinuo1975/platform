@@ -131,7 +131,7 @@ export class JsonIndexStore implements IndexStore {
       documents: VaultDocument[];
     }
   >();
-
+private completedSyncs = new Set<string>();
   constructor(private readonly indexFile: string) {}
 
   async load(): Promise<void> {
@@ -215,6 +215,10 @@ export class JsonIndexStore implements IndexStore {
     vaultId: string,
     syncId: string,
   ): Promise<void> {
+    const commitKey = `${vaultId}:${syncId}`;
+if (this.completedSyncs.has(commitKey)) {
+  return;
+}
     const batches = [...this.stagedSyncBatches.values()]
       .filter(
         (batch) =>
@@ -249,6 +253,7 @@ export class JsonIndexStore implements IndexStore {
     } as SyncPayload;
 
     await this.replace(payload);
+    this.completedSyncs.add(commitKey);
 
     for (const batch of batches) {
       this.stagedSyncBatches.delete(
