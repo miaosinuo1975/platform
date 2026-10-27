@@ -606,6 +606,126 @@ export class PostgresIndexStore implements IndexStore {
     }
   }
 
+  async stageSyncBatch(
+    vaultId: string,
+    syncId: string,
+    batchIndex: number,
+    totalBatches: number,
+    payload: Partial<SyncPayload>,
+    documents: VaultDocument[],
+  ): Promise<void> {
+    const tenantId =
+      payload.tenant_id ??
+      payload.manifest?.tenant_id ??
+      DEFAULT_TENANT_ID;
+
+    if (
+      !Number.isInteger(batchIndex) ||
+      !Number.isInteger(totalBatches) ||
+      batchIndex < 0 ||
+      totalBatches < 1 ||
+      batchIndex >= totalBatches
+    ) {
+      throw new Error("invalid_sync_batch");
+    }
+
+    await this.pool.query(
+      `delete from vault_sync_staging
+       where created_at < now() - interval '24 hours'`,
+    );
+
+    await this.pool.query(
+      `insert into vault_sync_staging (
+         tenant_id, vault_id, sync_id,
+         batch_index, total_batches,
+         payload, documents, created_at
+       )
+       values ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, now())
+       on conflict (
+         tenant_id, vault_id, sync_id, batch_index
+       )
+       do update set
+         total_batches = excluded.total_batches,
+         payload = excluded.payload,
+         documents = excluded.documents,
+         created_at = now()`,
+      [
+        tenantId,
+        vaultId,
+        syncId,
+        batchIndex,
+        totalBatches,
+        JSON.stringify(payload),
+        JSON.stringify(documents),
+      ],
+    );
+  }
+
+  async commitSyncBatch(
+    vaultId: string,
+    syncId: string,
+  ): Promise<void> {
+    const result = await this.pool.query<{
+      tenant_id: string;
+      batch_index: number;
+      total_batches: number;
+      payload: Partial<SyncPayload>;
+      documents: VaultDocument[];
+    }>(
+      `select
+         tenant_id, batch_index, total_batches,
+         payload, documents
+       from vault_sync_staging
+       where vault_id = $1 and sync_id = $2
+       order by batch_index asc`,
+      [vaultId, syncId],
+    );
+
+    const batches = result.rows;
+
+    if (batches.length === 0) {
+      throw new Error("sync_batches_not_found");
+    }
+
+    const totalBatches = batches[0].total_batches;
+    const tenantId = batches[0].tenant_id;
+
+    if (
+      batches.length !== totalBatches ||
+      batches.some(
+        (batch, index) =>
+          batch.batch_index !== index ||
+          batch.total_batches !== totalBatches ||
+          batch.tenant_id !== tenantId ||
+          !Array.isArray(batch.documents),
+      )
+    ) {
+      throw new Error("sync_batches_incomplete");
+    }
+
+    const payload = {
+      ...batches[0].payload,
+      tenant_id: tenantId,
+      vault_id: vaultId,
+      documents: batches.flatMap(
+        (batch) => batch.documents,
+      ),
+    } as SyncPayload;
+
+    // The existing replace() method performs the
+    // authoritative index replacement in a transaction.
+    // If it fails, staged data remains available.
+    await this.replace(payload);
+
+    await this.pool.query(
+      `delete from vault_sync_staging
+       where tenant_id = $1
+         and vault_id = $2
+         and sync_id = $3`,
+      [tenantId, vaultId, syncId],
+    );
+  }
+
   async replace(payload: SyncPayload): Promise<void> {
     const client = await this.pool.connect();
     const tenantId = payload.tenant_id ?? payload.manifest?.tenant_id ?? DEFAULT_TENANT_ID;
