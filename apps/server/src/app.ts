@@ -231,6 +231,15 @@ export function createApp(config: ServerConfig, store: IndexStore) {
         return;
       }
 
+if (
+  typeof body.tenant_id !== "string" ||
+  !body.tenant_id.trim() ||
+  body.tenant_id.length > 128
+) {
+  res.status(400).json({ error: "invalid_tenant_id" });
+  return;
+}
+
       await store.commitSyncBatch(vaultId, body.sync_id);
 
       res.json({
