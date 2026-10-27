@@ -824,63 +824,178 @@ export default class VaultMcpPlugin extends Plugin {
       throw error;
     }
   }
+    
+async syncNow() {
+  if (!this.settings.syncToken.trim()) {
+    const message =
+      "Sync token is required. Add the server admin sync token in Vault MCP settings before syncing.";
+    this.summary = { ...this.summary, lastError: message };
+    await this.addHistory({ type: "error", message });
+    new Notice(`Vault MCP: ${message}`);
+    return;
+  }
 
-  async syncNow() {
-    if (!this.settings.syncToken.trim()) {
-      const message = "Sync token is required. Add the server admin sync token in Vault MCP settings before syncing.";
-      this.summary = { ...this.summary, lastError: message };
-      await this.addHistory({ type: "error", message });
-      new Notice(`Vault MCP: ${message}`);
-      return;
+  try {
+    const payload = await this.buildSyncPayload();
+    const { documents, ...payloadMetadata } = payload;
+    const syncId = crypto.randomUUID();
+
+    // Keep each request comfortably below Vercel's
+    // function request-payload limit.
+    const maxBatchBytes = 700_000;
+    const batches: VaultDocument[][] = [];
+    let currentBatch: VaultDocument[] = [];
+
+    const estimateBytes = (
+      batch: VaultDocument[],
+      batchIndex: number,
+    ) => {
+      const body = JSON.stringify({
+        sync_id: syncId,
+        batch_index: batchIndex,
+        total_batches: 1,
+        payload: payloadMetadata,
+        documents: batch,
+      });
+      return new TextEncoder().encode(body).length;
+    };
+
+    for (const document of documents) {
+      const candidate = [...currentBatch, document];
+
+      if (
+        estimateBytes(candidate, batches.length) <=
+        maxBatchBytes
+      ) {
+        currentBatch = candidate;
+        continue;
+      }
+
+      if (currentBatch.length === 0) {
+        throw new Error(
+          `A single document exceeds the ${maxBatchBytes}-byte batch limit: ${document.metadata.path}`,
+        );
+      }
+
+      batches.push(currentBatch);
+      currentBatch = [document];
+
+      if (
+        estimateBytes(currentBatch, batches.length) >
+        maxBatchBytes
+      ) {
+        throw new Error(
+          `A single document exceeds the ${maxBatchBytes}-byte batch limit: ${document.metadata.path}`,
+        );
+      }
     }
 
-    try {
-      const payload = await this.buildSyncPayload();
+    if (currentBatch.length > 0 || batches.length === 0) {
+      batches.push(currentBatch);
+    }
+
+    const headers = {
+      Authorization: `Bearer ${this.settings.syncToken}`,
+      "Content-Type": "application/json",
+    };
+
+    const baseUrl =
+      `${this.serverBaseUrl()}/admin/vaults/` +
+      `${encodeURIComponent(this.settings.vaultId)}`;
+
+    // Stage every batch before committing the new index.
+    for (let batchIndex = 0;
+      batchIndex < batches.length;
+      batchIndex += 1) {
       const response = await requestUrl({
-        url: `${this.serverBaseUrl()}/admin/vaults/${encodeURIComponent(this.settings.vaultId)}/sync`,
+        url: `${baseUrl}/sync/batch`,
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.settings.syncToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
+        headers,
+        body: JSON.stringify({
+          sync_id: syncId,
+          batch_index: batchIndex,
+          total_batches: batches.length,
+          payload: payloadMetadata,
+          documents: batches[batchIndex],
+        }),
       });
 
       if (response.status < 200 || response.status >= 300) {
-        throw new Error(describeHttpFailure("sync", response.status, response.text));
+        throw new Error(
+          describeHttpFailure(
+            `sync batch ${batchIndex + 1}/${batches.length}`,
+            response.status,
+            response.text,
+          ),
+        );
       }
-
-      const syncResult = summarizeSyncResponse(payload, response.text);
-      this.summary = {
-        scanned: payload.stats?.scanned_markdown ?? 0,
-        indexed: payload.documents.length,
-        serverIndexed: syncResult.serverDocumentCount,
-        denied: payload.stats?.denied_markdown ?? 0,
-        reviewRequired: payload.stats?.review_required_markdown ?? 0,
-        redacted: payload.stats?.redacted_documents ?? 0,
-        generatedAt: payload.generated_at ?? null,
-        serverGeneratedAt: syncResult.serverGeneratedAt,
-        lastSuccessMessage: syncResult.message,
-        lastError: null,
-      };
-      this.indexPreview = null;
-      await this.addHistory({
-        type: "sync",
-        message: syncResult.message,
-        scanned: this.summary.scanned,
-        indexed: this.summary.indexed,
-        denied: this.summary.denied,
-        reviewRequired: this.summary.reviewRequired,
-        redacted: this.summary.redacted,
-      });
-      new Notice(`Vault MCP sync complete. ${syncResult.message}`);
-    } catch (error) {
-      const message = describeCaughtError("sync", error);
-      this.summary = { ...this.summary, lastError: message };
-      await this.addHistory({ type: "error", message: `Sync failed: ${message}` });
-      new Notice(`Vault MCP sync failed: ${message}`);
     }
+
+    // Commit only after all batches have been accepted.
+    const commitResponse = await requestUrl({
+      url: `${baseUrl}/sync/commit`,
+      method: "POST",
+      headers,
+      body: JSON.stringify({ sync_id: syncId }),
+    });
+
+    if (
+      commitResponse.status < 200 ||
+      commitResponse.status >= 300
+    ) {
+      throw new Error(
+        describeHttpFailure(
+          "sync commit",
+          commitResponse.status,
+          commitResponse.text,
+        ),
+      );
+    }
+
+    const syncResult = summarizeSyncResponse(
+      payload,
+      commitResponse.text,
+    );
+
+    this.summary = {
+      scanned: payload.stats?.scanned_markdown ?? 0,
+      indexed: payload.documents.length,
+      serverIndexed: syncResult.serverDocumentCount,
+      denied: payload.stats?.denied_markdown ?? 0,
+      reviewRequired:
+        payload.stats?.review_required_markdown ?? 0,
+      redacted: payload.stats?.redacted_documents ?? 0,
+      generatedAt: payload.generated_at ?? null,
+      serverGeneratedAt: syncResult.serverGeneratedAt,
+      lastSuccessMessage: syncResult.message,
+      lastError: null,
+    };
+
+    this.indexPreview = null;
+
+    await this.addHistory({
+      type: "sync",
+      message: syncResult.message,
+      scanned: this.summary.scanned,
+      indexed: this.summary.indexed,
+      denied: this.summary.denied,
+      reviewRequired: this.summary.reviewRequired,
+      redacted: this.summary.redacted,
+    });
+
+    new Notice(
+      `Vault MCP sync complete. ${syncResult.message}`,
+    );
+  } catch (error) {
+    const message = describeCaughtError("sync", error);
+    this.summary = { ...this.summary, lastError: message };
+    await this.addHistory({
+      type: "error",
+      message: `Sync failed: ${message}`,
+    });
+    new Notice(`Vault MCP sync failed: ${message}`);
   }
+}
 
   async checkServerConnection() {
     try {
