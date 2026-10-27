@@ -217,7 +217,10 @@ export function createApp(config: ServerConfig, store: IndexStore) {
     requireBearerToken(config.syncToken),
     async (req: Request, res: Response) => {
       const vaultId = paramValue(req.params.vaultId);
-      const body = req.body as { sync_id?: unknown };
+      const body = req.body as {
+  sync_id?: unknown;
+  tenant_id?: unknown;
+};
 
       if (
         typeof body.sync_id !== "string" ||
