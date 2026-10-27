@@ -726,52 +726,116 @@ export class PostgresIndexStore implements IndexStore {
     );
   }
 
-  async replace(payload: SyncPayload): Promise<void> {
-    const client = await this.pool.connect();
-    const tenantId = payload.tenant_id ?? payload.manifest?.tenant_id ?? DEFAULT_TENANT_ID;
-    const vaultId = payload.vault_id ?? payload.manifest?.vault_id ?? DEFAULT_VAULT_ID;
-    const installationId = payload.installation_id ?? payload.manifest?.installation_id ?? DEFAULT_INSTALLATION_ID;
-    try {
-      await client.query("begin");
-      if (payload.vault_id || payload.manifest?.vault_id) {
-        await client.query("delete from vault_documents where tenant_id = $1 and vault_id = $2", [tenantId, vaultId]);
-      } else {
-        await client.query("delete from vault_documents");
-      }
-      for (const document of payload.documents) {
-        const scopedDocument = withDocumentScope(document, tenantId, vaultId, installationId);
-        await client.query(
-          "insert into vault_documents (id, tenant_id, vault_id, installation_id, title, text, url, metadata) values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)",
-          [scopedDocument.id, tenantId, vaultId, installationId, scopedDocument.title, scopedDocument.text, scopedDocument.url, JSON.stringify(scopedDocument.metadata)],
-        );
-      }
+private async replaceWithClient(
+  payload: SyncPayload,
+  client: pg.PoolClient,
+): Promise<void> {
+  const tenantId =
+    payload.tenant_id ??
+    payload.manifest?.tenant_id ??
+    DEFAULT_TENANT_ID;
 
-      this.generatedAt = payload.generated_at ?? new Date().toISOString();
-      this.stats = payload.stats ?? null;
-      await client.query(
-        `insert into vault_index_meta (key, value) values
-          ('generated_at', $1::jsonb),
-          ('stats', $2::jsonb)
-        on conflict (key) do update set value = excluded.value`,
-        [JSON.stringify(this.generatedAt), JSON.stringify(this.stats)],
-      );
-      const manifest = syncManifestFromPayload(payload, tenantId, vaultId, installationId, this.generatedAt);
-      if (manifest) {
-        await client.query(
-          `insert into vault_sync_manifests (tenant_id, vault_id, manifest, updated_at)
-           values ($1, $2, $3::jsonb, now())
-           on conflict (tenant_id, vault_id) do update set manifest = excluded.manifest, updated_at = now()`,
-          [tenantId, vaultId, JSON.stringify(manifest)],
-        );
-      }
-      await client.query("commit");
-    } catch (error) {
-      await client.query("rollback");
-      throw error;
-    } finally {
-      client.release();
-    }
+  const vaultId =
+    payload.vault_id ??
+    payload.manifest?.vault_id ??
+    DEFAULT_VAULT_ID;
+
+  const installationId =
+    payload.installation_id ??
+    payload.manifest?.installation_id ??
+    DEFAULT_INSTALLATION_ID;
+
+  if (payload.vault_id || payload.manifest?.vault_id) {
+    await client.query(
+      "delete from vault_documents where tenant_id = $1 and vault_id = $2",
+      [tenantId, vaultId],
+    );
+  } else {
+    await client.query("delete from vault_documents");
   }
+
+  for (const document of payload.documents) {
+    const scopedDocument = withDocumentScope(
+      document,
+      tenantId,
+      vaultId,
+      installationId,
+    );
+
+    await client.query(
+      `insert into vault_documents
+       (id, tenant_id, vault_id, installation_id,
+        title, text, url, metadata)
+       values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+      [
+        scopedDocument.id,
+        tenantId,
+        vaultId,
+        installationId,
+        scopedDocument.title,
+        scopedDocument.text,
+        scopedDocument.url,
+        JSON.stringify(scopedDocument.metadata),
+      ],
+    );
+  }
+
+  const generatedAt =
+    payload.generated_at ?? new Date().toISOString();
+
+  const stats = payload.stats ?? null;
+
+  await client.query(
+    `insert into vault_index_meta (key, value) values
+       ('generated_at', $1::jsonb),
+       ('stats', $2::jsonb)
+     on conflict (key) do update set value = excluded.value`,
+    [JSON.stringify(generatedAt), JSON.stringify(stats)],
+  );
+
+  const manifest = syncManifestFromPayload(
+    payload,
+    tenantId,
+    vaultId,
+    installationId,
+    generatedAt,
+  );
+
+  if (manifest) {
+    await client.query(
+      `insert into vault_sync_manifests
+       (tenant_id, vault_id, manifest, updated_at)
+       values ($1, $2, $3::jsonb, now())
+       on conflict (tenant_id, vault_id)
+       do update set
+         manifest = excluded.manifest,
+         updated_at = now()`,
+      [tenantId, vaultId, JSON.stringify(manifest)],
+    );
+  }
+
+  this.generatedAt = generatedAt;
+  this.stats = stats;
+}
+
+  
+async replace(payload: SyncPayload): Promise<void> {
+  const client = await this.pool.connect();
+
+  try {
+    await client.query("begin");
+
+    await this.replaceWithClient(payload, client);
+
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 
   async health(): Promise<IndexHealth> {
     try {
