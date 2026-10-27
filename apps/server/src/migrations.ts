@@ -151,8 +151,27 @@ export const POSTGRES_MIGRATIONS: PostgresMigration[] = [
         on vault_sync_staging (vault_id, sync_id);
     `,
   },
+  
+  {
+    id: "0004_completed_vault_syncs",
+    description: "Record completed vault syncs for safe idempotent retries.",
+    sql: `
+      create table if not exists vault_sync_commits (
+        tenant_id text not null,
+        vault_id text not null,
+        sync_id text not null,
+        result jsonb not null,
+        committed_at timestamptz not null default now(),
+        primary key (tenant_id, vault_id, sync_id)
+      );
 
+      create index if not exists vault_sync_commits_created_idx
+        on vault_sync_commits (committed_at);
+    `,
+  },
 ];
+
+
 
 export async function runPostgresMigrations(pool: pg.Pool): Promise<PostgresMigrationResult> {
   const client = await pool.connect();
