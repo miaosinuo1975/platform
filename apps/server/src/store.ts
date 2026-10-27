@@ -69,6 +69,19 @@ export interface IndexStore {
   registerVault(manifest: SyncManifest): Promise<void>;
   deleteVault(vaultId: string): Promise<void>;
   replace(payload: SyncPayload): Promise<void>;
+  stageSyncBatch(
+    vaultId: string,
+    syncId: string,
+    batchIndex: number,
+    totalBatches: number,
+    payload: Partial<SyncPayload>,
+    documents: VaultDocument[],
+  ): Promise<void>;
+
+  commitSyncBatch(
+    vaultId: string,
+    syncId: string,
+  ): Promise<void>;
   health(): IndexHealth | Promise<IndexHealth>;
   search(query: string, limit?: number, scope?: string): SearchResponse | Promise<SearchResponse>;
   searchNotes(options: SearchOptions): SearchResponse | Promise<SearchResponse>;
@@ -107,6 +120,17 @@ export class JsonIndexStore implements IndexStore {
   private localAgents = new Map<string, LocalAgentStatus>();
   private oauthClients = new Map<string, StoredOAuthClient>();
   private consumedOAuthJtis = new Map<string, number>();
+  private stagedSyncBatches = new Map<
+    string,
+    {
+      vaultId: string;
+      syncId: string;
+      batchIndex: number;
+      totalBatches: number;
+      payload: Partial<SyncPayload>;
+      documents: VaultDocument[];
+    }
+  >();
 
   constructor(private readonly indexFile: string) {}
 
@@ -165,6 +189,72 @@ export class JsonIndexStore implements IndexStore {
     }
     await fs.mkdir(path.dirname(this.indexFile), { recursive: true });
     await fs.writeFile(this.indexFile, `${JSON.stringify(this.snapshot(), null, 2)}\n`, "utf8");
+  }
+
+  async stageSyncBatch(
+    vaultId: string,
+    syncId: string,
+    batchIndex: number,
+    totalBatches: number,
+    payload: Partial<SyncPayload>,
+    documents: VaultDocument[],
+  ): Promise<void> {
+    const key = `${vaultId}:${syncId}:${batchIndex}`;
+
+    this.stagedSyncBatches.set(key, {
+      vaultId,
+      syncId,
+      batchIndex,
+      totalBatches,
+      payload,
+      documents,
+    });
+  }
+
+  async commitSyncBatch(
+    vaultId: string,
+    syncId: string,
+  ): Promise<void> {
+    const batches = [...this.stagedSyncBatches.values()]
+      .filter(
+        (batch) =>
+          batch.vaultId === vaultId &&
+          batch.syncId === syncId,
+      )
+      .sort((a, b) => a.batchIndex - b.batchIndex);
+
+    if (batches.length === 0) {
+      throw new Error("sync_batches_not_found");
+    }
+
+    const totalBatches = batches[0].totalBatches;
+
+    if (
+      batches.length !== totalBatches ||
+      batches.some(
+        (batch, index) =>
+          batch.batchIndex !== index ||
+          batch.totalBatches !== totalBatches,
+      )
+    ) {
+      throw new Error("sync_batches_incomplete");
+    }
+
+    const payload = {
+      ...batches[0].payload,
+      vault_id: vaultId,
+      documents: batches.flatMap(
+        (batch) => batch.documents,
+      ),
+    } as SyncPayload;
+
+    await this.replace(payload);
+
+    for (const batch of batches) {
+      this.stagedSyncBatches.delete(
+        `${vaultId}:${syncId}:${batch.batchIndex}`,
+      );
+    }
   }
 
   async replace(payload: SyncPayload): Promise<void> {
