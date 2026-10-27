@@ -160,6 +160,20 @@ it("stages vault sync batches and rejects incomplete commits", async () => {
 
   expect(completeCommit.status).toBe(200);
   expect((await store.vaultStatus(vaultId)).document_count).toBe(2);
+const retryCommit = await fetch(
+  `${baseUrl}/admin/vaults/${vaultId}/sync/commit`,
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.syncToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ sync_id: syncId }),
+  },
+);
+
+expect(retryCommit.status).toBe(200);
+expect((await store.vaultStatus(vaultId)).document_count).toBe(2);
 });
 
   it("syncs documents and exposes read-only vault tools over authenticated MCP", async () => {
