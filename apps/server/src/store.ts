@@ -679,6 +679,27 @@ async commitSyncBatch(
   try {
     await client.query("begin");
     transactionStarted = true;
+    // Serialize retries for the same vault and sync.
+    await client.query(
+      "select pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+      [vaultId, syncId],
+    );
+
+    // Return successfully if this sync was already committed.
+    const completed = await client.query(
+      `select sync_id
+       from vault_sync_commits
+       where vault_id = $1 and sync_id = $2
+       limit 1`,
+      [vaultId, syncId],
+    );
+
+    if (completed.rows.length > 0) {
+      await client.query("commit");
+      transactionStarted = false;
+      return;
+    }
+
 
     const result = await client.query<{
       tenant_id: string;
@@ -731,6 +752,24 @@ async commitSyncBatch(
     } as SyncPayload;
 
     await this.replaceWithClient(payload, client);
+
+    await client.query(
+      `insert into vault_sync_commits
+       (tenant_id, vault_id, sync_id, result, committed_at)
+       values ($1, $2, $3, $4::jsonb, now())
+       on conflict (tenant_id, vault_id, sync_id)
+       do nothing`,
+      [
+        tenantId,
+        vaultId,
+        syncId,
+        JSON.stringify({
+          ok: true,
+          vault_id: vaultId,
+          sync_id: syncId,
+        }),
+      ],
+    );
 
     await client.query(
       `delete from vault_sync_staging
