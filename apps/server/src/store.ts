@@ -252,8 +252,12 @@ const batches = [...this.stagedSyncBatches.values()]
       batches.some(
         (batch, index) =>
           batch.batchIndex !== index ||
-          batch.totalBatches !== totalBatches,
-        batch.tenant_id !== tenantId ||
+          batch.totalBatches !== totalBatches ||
+          (
+            batch.payload.tenant_id ??
+            batch.payload.manifest?.tenant_id ??
+            DEFAULT_TENANT_ID
+          ) !== tenantId,
       )
     ) {
       throw new Error("sync_batches_incomplete");
