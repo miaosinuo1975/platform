@@ -79,9 +79,10 @@ export interface IndexStore {
   ): Promise<void>;
 
   commitSyncBatch(
-    vaultId: string,
-    syncId: string,
-  ): Promise<void>;
+  tenantId: string,
+  vaultId: string,
+  syncId: string,
+): Promise<void>;
   health(): IndexHealth | Promise<IndexHealth>;
   search(query: string, limit?: number, scope?: string): SearchResponse | Promise<SearchResponse>;
   searchNotes(options: SearchOptions): SearchResponse | Promise<SearchResponse>;
@@ -199,7 +200,12 @@ private completedSyncs = new Set<string>();
     payload: Partial<SyncPayload>,
     documents: VaultDocument[],
   ): Promise<void> {
-    const key = `${vaultId}:${syncId}:${batchIndex}`;
+   const tenantId =
+  payload.tenant_id ??
+  payload.manifest?.tenant_id ??
+  DEFAULT_TENANT_ID;
+
+const key = `${tenantId}:${vaultId}:${syncId}:${batchIndex}`;
 
     this.stagedSyncBatches.set(key, {
       vaultId,
@@ -212,19 +218,27 @@ private completedSyncs = new Set<string>();
   }
 
   async commitSyncBatch(
-    vaultId: string,
-    syncId: string,
-  ): Promise<void> {
-    const commitKey = `${vaultId}:${syncId}`;
+  tenantId: string,
+  vaultId: string,
+  syncId: string,
+): Promise<void> {
+    const commitKey = `${tenantId}:${vaultId}:${syncId}`;
 if (this.completedSyncs.has(commitKey)) {
   return;
 }
-    const batches = [...this.stagedSyncBatches.values()]
-      .filter(
-        (batch) =>
-          batch.vaultId === vaultId &&
-          batch.syncId === syncId,
-      )
+    
+const batches = [...this.stagedSyncBatches.values()]
+  .filter(
+    (batch) =>
+      batch.vaultId === vaultId &&
+      batch.syncId === syncId &&
+      (
+        batch.payload.tenant_id ??
+        batch.payload.manifest?.tenant_id ??
+        DEFAULT_TENANT_ID
+      ) === tenantId,
+  )
+
       .sort((a, b) => a.batchIndex - b.batchIndex);
 
     if (batches.length === 0) {
@@ -239,6 +253,7 @@ if (this.completedSyncs.has(commitKey)) {
         (batch, index) =>
           batch.batchIndex !== index ||
           batch.totalBatches !== totalBatches,
+        batch.tenant_id !== tenantId ||
       )
     ) {
       throw new Error("sync_batches_incomplete");
@@ -257,7 +272,7 @@ if (this.completedSyncs.has(commitKey)) {
 
     for (const batch of batches) {
       this.stagedSyncBatches.delete(
-        `${vaultId}:${syncId}:${batch.batchIndex}`,
+       `${tenantId}:${vaultId}:${syncId}:${batch.batchIndex}`
       );
     }
   }
@@ -668,6 +683,7 @@ export class PostgresIndexStore implements IndexStore {
 
   
 async commitSyncBatch(
+  tenantId: string,
   vaultId: string,
   syncId: string,
 ): Promise<void> {
@@ -680,18 +696,21 @@ async commitSyncBatch(
     await client.query("begin");
     transactionStarted = true;
     // Serialize retries for the same vault and sync.
-    await client.query(
-      "select pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-      [vaultId, syncId],
+   
+await client.query(
+  "select pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+  [tenantId, `${vaultId}:${syncId}`],
     );
 
     // Return successfully if this sync was already committed.
     const completed = await client.query(
-      `select sync_id
-       from vault_sync_commits
-       where vault_id = $1 and sync_id = $2
-       limit 1`,
-      [vaultId, syncId],
+      select sync_id
+from vault_sync_commits
+where tenant_id = $1
+  and vault_id = $2
+  and sync_id = $3
+limit 1，
+      [tenantId, vaultId, syncId],
     );
 
     if (completed.rows.length > 0) {
@@ -712,10 +731,12 @@ async commitSyncBatch(
          tenant_id, batch_index, total_batches,
          payload, documents
        from vault_sync_staging
-       where vault_id = $1 and sync_id = $2
+       where tenant_id = $1
+  and vault_id = $2
+  and sync_id = $3
        order by batch_index asc
        for update`,
-      [vaultId, syncId],
+      [tenantId, vaultId, syncId],
     );
 
     const batches = result.rows;
@@ -725,7 +746,6 @@ async commitSyncBatch(
     }
 
     const totalBatches = batches[0].total_batches;
-    const tenantId = batches[0].tenant_id;
 
     if (
       !Number.isInteger(totalBatches) ||
