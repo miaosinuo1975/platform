@@ -120,7 +120,58 @@ export const POSTGRES_MIGRATIONS: PostgresMigration[] = [
         on local_agent_sessions (tenant_id, vault_id, last_seen_at desc);
     `,
   },
+  {
+    id: "0003_staged_vault_sync",
+    description: "Stage bounded vault sync batches before committing the complete vault index.",
+    sql: `
+      create table if not exists vault_sync_staging (
+        tenant_id text not null,
+        vault_id text not null,
+        sync_id text not null,
+        batch_index integer not null,
+        total_batches integer not null,
+        payload jsonb not null,
+        documents jsonb not null,
+        created_at timestamptz not null default now(),
+        primary key (
+          tenant_id,
+          vault_id,
+          sync_id,
+          batch_index
+        ),
+        check (batch_index >= 0),
+        check (total_batches > 0),
+        check (batch_index < total_batches)
+      );
+
+      create index if not exists vault_sync_staging_created_idx
+        on vault_sync_staging (created_at);
+
+      create index if not exists vault_sync_staging_sync_idx
+        on vault_sync_staging (vault_id, sync_id);
+    `,
+  },
+  
+  {
+    id: "0004_completed_vault_syncs",
+    description: "Record completed vault syncs for safe idempotent retries.",
+    sql: `
+      create table if not exists vault_sync_commits (
+        tenant_id text not null,
+        vault_id text not null,
+        sync_id text not null,
+        result jsonb not null,
+        committed_at timestamptz not null default now(),
+        primary key (tenant_id, vault_id, sync_id)
+      );
+
+      create index if not exists vault_sync_commits_created_idx
+        on vault_sync_commits (committed_at);
+    `,
+  },
 ];
+
+
 
 export async function runPostgresMigrations(pool: pg.Pool): Promise<PostgresMigrationResult> {
   const client = await pool.connect();

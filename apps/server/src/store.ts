@@ -69,6 +69,20 @@ export interface IndexStore {
   registerVault(manifest: SyncManifest): Promise<void>;
   deleteVault(vaultId: string): Promise<void>;
   replace(payload: SyncPayload): Promise<void>;
+  stageSyncBatch(
+    vaultId: string,
+    syncId: string,
+    batchIndex: number,
+    totalBatches: number,
+    payload: Partial<SyncPayload>,
+    documents: VaultDocument[],
+  ): Promise<void>;
+
+  commitSyncBatch(
+  tenantId: string,
+  vaultId: string,
+  syncId: string,
+): Promise<void>;
   health(): IndexHealth | Promise<IndexHealth>;
   search(query: string, limit?: number, scope?: string): SearchResponse | Promise<SearchResponse>;
   searchNotes(options: SearchOptions): SearchResponse | Promise<SearchResponse>;
@@ -107,7 +121,18 @@ export class JsonIndexStore implements IndexStore {
   private localAgents = new Map<string, LocalAgentStatus>();
   private oauthClients = new Map<string, StoredOAuthClient>();
   private consumedOAuthJtis = new Map<string, number>();
-
+  private stagedSyncBatches = new Map<
+    string,
+    {
+      vaultId: string;
+      syncId: string;
+      batchIndex: number;
+      totalBatches: number;
+      payload: Partial<SyncPayload>;
+      documents: VaultDocument[];
+    }
+  >();
+private completedSyncs = new Set<string>();
   constructor(private readonly indexFile: string) {}
 
   async load(): Promise<void> {
@@ -165,6 +190,95 @@ export class JsonIndexStore implements IndexStore {
     }
     await fs.mkdir(path.dirname(this.indexFile), { recursive: true });
     await fs.writeFile(this.indexFile, `${JSON.stringify(this.snapshot(), null, 2)}\n`, "utf8");
+  }
+
+  async stageSyncBatch(
+    vaultId: string,
+    syncId: string,
+    batchIndex: number,
+    totalBatches: number,
+    payload: Partial<SyncPayload>,
+    documents: VaultDocument[],
+  ): Promise<void> {
+   const tenantId =
+  payload.tenant_id ??
+  payload.manifest?.tenant_id ??
+  DEFAULT_TENANT_ID;
+
+const key = `${tenantId}:${vaultId}:${syncId}:${batchIndex}`;
+
+    this.stagedSyncBatches.set(key, {
+      vaultId,
+      syncId,
+      batchIndex,
+      totalBatches,
+      payload,
+      documents,
+    });
+  }
+
+  async commitSyncBatch(
+  tenantId: string,
+  vaultId: string,
+  syncId: string,
+): Promise<void> {
+    const commitKey = `${tenantId}:${vaultId}:${syncId}`;
+if (this.completedSyncs.has(commitKey)) {
+  return;
+}
+    
+const batches = [...this.stagedSyncBatches.values()]
+  .filter(
+    (batch) =>
+      batch.vaultId === vaultId &&
+      batch.syncId === syncId &&
+      (
+        batch.payload.tenant_id ??
+        batch.payload.manifest?.tenant_id ??
+        DEFAULT_TENANT_ID
+      ) === tenantId,
+  )
+
+      .sort((a, b) => a.batchIndex - b.batchIndex);
+
+    if (batches.length === 0) {
+      throw new Error("sync_batches_not_found");
+    }
+
+    const totalBatches = batches[0].totalBatches;
+
+    if (
+      batches.length !== totalBatches ||
+      batches.some(
+        (batch, index) =>
+          batch.batchIndex !== index ||
+          batch.totalBatches !== totalBatches ||
+          (
+            batch.payload.tenant_id ??
+            batch.payload.manifest?.tenant_id ??
+            DEFAULT_TENANT_ID
+          ) !== tenantId,
+      )
+    ) {
+      throw new Error("sync_batches_incomplete");
+    }
+
+    const payload = {
+      ...batches[0].payload,
+      vault_id: vaultId,
+      documents: batches.flatMap(
+        (batch) => batch.documents,
+      ),
+    } as SyncPayload;
+
+    await this.replace(payload);
+    this.completedSyncs.add(commitKey);
+
+    for (const batch of batches) {
+      this.stagedSyncBatches.delete(
+       `${tenantId}:${vaultId}:${syncId}:${batch.batchIndex}`
+      );
+    }
   }
 
   async replace(payload: SyncPayload): Promise<void> {
@@ -516,52 +630,307 @@ export class PostgresIndexStore implements IndexStore {
     }
   }
 
-  async replace(payload: SyncPayload): Promise<void> {
-    const client = await this.pool.connect();
-    const tenantId = payload.tenant_id ?? payload.manifest?.tenant_id ?? DEFAULT_TENANT_ID;
-    const vaultId = payload.vault_id ?? payload.manifest?.vault_id ?? DEFAULT_VAULT_ID;
-    const installationId = payload.installation_id ?? payload.manifest?.installation_id ?? DEFAULT_INSTALLATION_ID;
-    try {
-      await client.query("begin");
-      if (payload.vault_id || payload.manifest?.vault_id) {
-        await client.query("delete from vault_documents where tenant_id = $1 and vault_id = $2", [tenantId, vaultId]);
-      } else {
-        await client.query("delete from vault_documents");
-      }
-      for (const document of payload.documents) {
-        const scopedDocument = withDocumentScope(document, tenantId, vaultId, installationId);
-        await client.query(
-          "insert into vault_documents (id, tenant_id, vault_id, installation_id, title, text, url, metadata) values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)",
-          [scopedDocument.id, tenantId, vaultId, installationId, scopedDocument.title, scopedDocument.text, scopedDocument.url, JSON.stringify(scopedDocument.metadata)],
-        );
-      }
+  async stageSyncBatch(
+    vaultId: string,
+    syncId: string,
+    batchIndex: number,
+    totalBatches: number,
+    payload: Partial<SyncPayload>,
+    documents: VaultDocument[],
+  ): Promise<void> {
+    const tenantId =
+      payload.tenant_id ??
+      payload.manifest?.tenant_id ??
+      DEFAULT_TENANT_ID;
 
-      this.generatedAt = payload.generated_at ?? new Date().toISOString();
-      this.stats = payload.stats ?? null;
-      await client.query(
-        `insert into vault_index_meta (key, value) values
-          ('generated_at', $1::jsonb),
-          ('stats', $2::jsonb)
-        on conflict (key) do update set value = excluded.value`,
-        [JSON.stringify(this.generatedAt), JSON.stringify(this.stats)],
-      );
-      const manifest = syncManifestFromPayload(payload, tenantId, vaultId, installationId, this.generatedAt);
-      if (manifest) {
-        await client.query(
-          `insert into vault_sync_manifests (tenant_id, vault_id, manifest, updated_at)
-           values ($1, $2, $3::jsonb, now())
-           on conflict (tenant_id, vault_id) do update set manifest = excluded.manifest, updated_at = now()`,
-          [tenantId, vaultId, JSON.stringify(manifest)],
-        );
-      }
-      await client.query("commit");
-    } catch (error) {
-      await client.query("rollback");
-      throw error;
-    } finally {
-      client.release();
+    if (
+      !Number.isInteger(batchIndex) ||
+      !Number.isInteger(totalBatches) ||
+      batchIndex < 0 ||
+      totalBatches < 1 ||
+      batchIndex >= totalBatches
+    ) {
+      throw new Error("invalid_sync_batch");
     }
+
+    await this.pool.query(
+      `delete from vault_sync_staging
+       where created_at < now() - interval '24 hours'`,
+    );
+
+    await this.pool.query(
+      `insert into vault_sync_staging (
+         tenant_id, vault_id, sync_id,
+         batch_index, total_batches,
+         payload, documents, created_at
+       )
+       values ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, now())
+       on conflict (
+         tenant_id, vault_id, sync_id, batch_index
+       )
+       do update set
+         total_batches = excluded.total_batches,
+         payload = excluded.payload,
+         documents = excluded.documents,
+         created_at = now()`,
+      [
+        tenantId,
+        vaultId,
+        syncId,
+        batchIndex,
+        totalBatches,
+        JSON.stringify(payload),
+        JSON.stringify(documents),
+      ],
+    );
   }
+
+  
+async commitSyncBatch(
+  tenantId: string,
+  vaultId: string,
+  syncId: string,
+): Promise<void> {
+  const client = await this.pool.connect();
+  const previousGeneratedAt = this.generatedAt;
+  const previousStats = this.stats;
+  let transactionStarted = false;
+
+  try {
+    await client.query("begin");
+    transactionStarted = true;
+    // Serialize retries for the same vault and sync.
+   
+await client.query(
+  "select pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+  [tenantId, `${vaultId}:${syncId}`],
+    );
+
+    // Return successfully if this sync was already committed.
+    const completed = await client.query(
+      select sync_id
+from vault_sync_commits
+where tenant_id = $1
+  and vault_id = $2
+  and sync_id = $3
+limit 1，
+      [tenantId, vaultId, syncId],
+    );
+
+    if (completed.rows.length > 0) {
+      await client.query("commit");
+      transactionStarted = false;
+      return;
+    }
+
+
+    const result = await client.query<{
+      tenant_id: string;
+      batch_index: number;
+      total_batches: number;
+      payload: Partial<SyncPayload>;
+      documents: VaultDocument[];
+    }>(
+      `select
+         tenant_id, batch_index, total_batches,
+         payload, documents
+       from vault_sync_staging
+       where tenant_id = $1
+  and vault_id = $2
+  and sync_id = $3
+       order by batch_index asc
+       for update`,
+      [tenantId, vaultId, syncId],
+    );
+
+    const batches = result.rows;
+
+    if (batches.length === 0) {
+      throw new Error("sync_batches_not_found");
+    }
+
+    const totalBatches = batches[0].total_batches;
+
+    if (
+      !Number.isInteger(totalBatches) ||
+      totalBatches < 1 ||
+      batches.length !== totalBatches ||
+      batches.some(
+        (batch, index) =>
+          batch.batch_index !== index ||
+          batch.total_batches !== totalBatches ||
+          batch.tenant_id !== tenantId ||
+          !Array.isArray(batch.documents),
+      )
+    ) {
+      throw new Error("sync_batches_incomplete");
+    }
+
+    const payload = {
+      ...batches[0].payload,
+      tenant_id: tenantId,
+      vault_id: vaultId,
+      documents: batches.flatMap(
+        (batch) => batch.documents,
+      ),
+    } as SyncPayload;
+
+    await this.replaceWithClient(payload, client);
+
+    await client.query(
+      `insert into vault_sync_commits
+       (tenant_id, vault_id, sync_id, result, committed_at)
+       values ($1, $2, $3, $4::jsonb, now())
+       on conflict (tenant_id, vault_id, sync_id)
+       do nothing`,
+      [
+        tenantId,
+        vaultId,
+        syncId,
+        JSON.stringify({
+          ok: true,
+          vault_id: vaultId,
+          sync_id: syncId,
+        }),
+      ],
+    );
+
+    await client.query(
+      `delete from vault_sync_staging
+       where tenant_id = $1
+         and vault_id = $2
+         and sync_id = $3`,
+      [tenantId, vaultId, syncId],
+    );
+
+    await client.query("commit");
+    transactionStarted = false;
+  } catch (error) {
+    if (transactionStarted) {
+      try {
+        await client.query("rollback");
+      } finally {
+        this.generatedAt = previousGeneratedAt;
+        this.stats = previousStats;
+      }
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+private async replaceWithClient(
+  payload: SyncPayload,
+  client: pg.PoolClient,
+): Promise<void> {
+  const tenantId =
+    payload.tenant_id ??
+    payload.manifest?.tenant_id ??
+    DEFAULT_TENANT_ID;
+
+  const vaultId =
+    payload.vault_id ??
+    payload.manifest?.vault_id ??
+    DEFAULT_VAULT_ID;
+
+  const installationId =
+    payload.installation_id ??
+    payload.manifest?.installation_id ??
+    DEFAULT_INSTALLATION_ID;
+
+  if (payload.vault_id || payload.manifest?.vault_id) {
+    await client.query(
+      "delete from vault_documents where tenant_id = $1 and vault_id = $2",
+      [tenantId, vaultId],
+    );
+  } else {
+    await client.query("delete from vault_documents");
+  }
+
+  for (const document of payload.documents) {
+    const scopedDocument = withDocumentScope(
+      document,
+      tenantId,
+      vaultId,
+      installationId,
+    );
+
+    await client.query(
+      `insert into vault_documents
+       (id, tenant_id, vault_id, installation_id,
+        title, text, url, metadata)
+       values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+      [
+        scopedDocument.id,
+        tenantId,
+        vaultId,
+        installationId,
+        scopedDocument.title,
+        scopedDocument.text,
+        scopedDocument.url,
+        JSON.stringify(scopedDocument.metadata),
+      ],
+    );
+  }
+
+  const generatedAt =
+    payload.generated_at ?? new Date().toISOString();
+
+  const stats = payload.stats ?? null;
+
+  await client.query(
+    `insert into vault_index_meta (key, value) values
+       ('generated_at', $1::jsonb),
+       ('stats', $2::jsonb)
+     on conflict (key) do update set value = excluded.value`,
+    [JSON.stringify(generatedAt), JSON.stringify(stats)],
+  );
+
+  const manifest = syncManifestFromPayload(
+    payload,
+    tenantId,
+    vaultId,
+    installationId,
+    generatedAt,
+  );
+
+  if (manifest) {
+    await client.query(
+      `insert into vault_sync_manifests
+       (tenant_id, vault_id, manifest, updated_at)
+       values ($1, $2, $3::jsonb, now())
+       on conflict (tenant_id, vault_id)
+       do update set
+         manifest = excluded.manifest,
+         updated_at = now()`,
+      [tenantId, vaultId, JSON.stringify(manifest)],
+    );
+  }
+
+  this.generatedAt = generatedAt;
+  this.stats = stats;
+}
+
+  
+async replace(payload: SyncPayload): Promise<void> {
+  const client = await this.pool.connect();
+
+  try {
+    await client.query("begin");
+
+    await this.replaceWithClient(payload, client);
+
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 
   async health(): Promise<IndexHealth> {
     try {

@@ -377,3 +377,9 @@ directories.
 checks the MCP Inspector localhost origins, preflight behavior, authenticated
 SSE, forbidden-origin rejection, and local filesystem tool calls through an
 Inspector-origin request.
+
+## Candidate validation
+
+The staged vault sync change is under review.
+Automated build and test results must be verified
+before merging or deploying to production.
