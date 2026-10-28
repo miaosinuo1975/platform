@@ -157,7 +157,12 @@ it("stages vault sync batches and rejects incomplete commits", async () => {
         Authorization: `Bearer ${config.syncToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ sync_id: syncId }),
+      
+body: JSON.stringify({
+  sync_id: syncId,
+  tenant_id: "default",
+}),
+
     },
   );
 
@@ -171,7 +176,12 @@ const retryCommit = await fetch(
       Authorization: `Bearer ${config.syncToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ sync_id: syncId }),
+    
+body: JSON.stringify({
+  sync_id: syncId,
+  tenant_id: "default",
+}),
+
   },
 );
 
