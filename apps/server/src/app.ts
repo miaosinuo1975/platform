@@ -240,7 +240,13 @@ if (
   return;
 }
 
-      await store.commitSyncBatch(vaultId, body.sync_id);
+      
+await store.commitSyncBatch(
+  body.tenant_id,
+  vaultId,
+  body.sync_id,
+);
+
 
       res.json({
         ok: true,
